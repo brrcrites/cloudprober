@@ -417,7 +417,7 @@ func (s *SDSurfacer) recordEventMetrics(em *metrics.EventMetrics) (ts []*monitor
 // Non-stackdriver Helper Functions
 //-----------------------------------------------------------------------------
 
-// checkMetricLength checks if the combination of the metricName and the url
+// validMetricLength checks if the combination of the metricName and the url
 // prefix are longer than 100 characters, which is illegal in a Stackdriver
 // call. Stack Driver doesn't allow custom metrics with more than 100 character
 // names, so we have a check to see if we are going over the limit.
