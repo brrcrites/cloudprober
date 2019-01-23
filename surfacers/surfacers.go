@@ -36,6 +36,7 @@ import (
 	"github.com/google/cloudprober/surfacers/postgres"
 	"github.com/google/cloudprober/surfacers/prometheus"
 	"github.com/google/cloudprober/surfacers/stackdriver"
+	"github.com/google/cloudprober/surfacers/datadog"
 	"github.com/google/cloudprober/web/formatutils"
 
 	surfacerpb "github.com/google/cloudprober/surfacers/proto"
@@ -100,6 +101,8 @@ type SurfacerInfo struct {
 
 func inferType(s *surfacerpb.SurfacerDef) surfacerspb.Type {
 	switch s.Surfacer.(type) {
+    case *surfacerpb.SurfaceDef_DataDogSurfacer:
+        return surfacerspb.Type_DATADOG
 	case *surfacerpb.SurfacerDef_PrometheusSurfacer:
 		return surfacerspb.Type_PROMETHEUS
 	case *surfacerpb.SurfacerDef_StackdriverSurfacer:
@@ -131,6 +134,9 @@ func initSurfacer(s *surfacerpb.SurfacerDef, sType surfacerspb.Type) (Surfacer, 
 	var surfacer Surfacer
 
 	switch sType {
+    case surfacerpb.Type_DATADOG:
+        surfacer, err = datadog.New(s.GetDataDogSurfacer(), l)
+        conf = s.GetDataDogSurfacer()
 	case surfacerpb.Type_PROMETHEUS:
 		surfacer, err = prometheus.New(s.GetPrometheusSurfacer(), l)
 		conf = s.GetPrometheusSurfacer()

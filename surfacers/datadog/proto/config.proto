@@ -1,0 +1,9 @@
+syntax = "proto2";
+
+package cloudprober.surfacer.datadog;
+
+message SurfacerConf {
+  optional string monitoring_url = 1; 
+  optional string namespace = 2;
+  optional string tag = 3 [default = "cloudprober"];
+}
