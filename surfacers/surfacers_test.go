@@ -15,8 +15,13 @@
 package surfacers
 
 import (
+	"io/ioutil"
+	"os"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/google/cloudprober/surfacers/file"
+	fileconfigpb "github.com/google/cloudprober/surfacers/file/proto"
 	surfacerpb "github.com/google/cloudprober/surfacers/proto"
 )
 
@@ -36,6 +41,35 @@ func TestEmptyConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(s) != 0 {
+		t.Errorf("Got surfacers for zero config: %v", s)
+	}
+}
+
+func TestInferType(t *testing.T) {
+	tmpfile, err := ioutil.TempFile("", "example")
+	if err != nil {
+		t.Fatalf("error creating tempfile for test")
+	}
+
+	defer os.Remove(tmpfile.Name()) // clean up
+
+	s, err := Init([]*surfacerpb.SurfacerDef{
+		{
+			Surfacer: &surfacerpb.SurfacerDef_FileSurfacer{
+				&fileconfigpb.SurfacerConf{
+					FilePath: proto.String(tmpfile.Name()),
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s) != 1 {
+		t.Errorf("len(s)=%d, expected=1", len(s))
+	}
+	if _, ok := s[0].Surfacer.(*file.FileSurfacer); !ok {
 		t.Errorf("Got surfacers for zero config: %v", s)
 	}
 }

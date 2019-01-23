@@ -26,19 +26,16 @@ import (
 	"github.com/google/cloudprober/logger"
 	configpb "github.com/google/cloudprober/targets/gce/proto"
 	dnsRes "github.com/google/cloudprober/targets/resolver"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
 )
 
-// globalInstancesProvider is a singleton instance of the instancesProvider struct.
-// It is presented as a singleton because, like forwardingRules, instances provides
-// a cache layer that is best shared by all probes.
-var (
-	// Mutex to safely initialize the globalInstanceProvider
-	globalInstancesProviderMu sync.Mutex
-	globalInstancesProvider   *instancesProvider
-)
+// globalInstancesProvider is an instance of the instancesProvider struct.
+// There is only one globalInstancesProvider per project. Like forwardingRules,
+// it provides a cache layer that is best shared by all probes in a project.
+var globalInstancesProvider = map[string]*instancesProvider{}
+
+// Mutex to safely initialize the globalInstanceProvider
+var globalInstancesProviderMu sync.Mutex
 
 // This is how long we wait between API calls per zone.
 const defaultAPICallInterval = 250 * time.Microsecond
@@ -47,13 +44,14 @@ const defaultAPICallInterval = 250 * time.Microsecond
 // set of GCE instances targets, for example for VM-to-VM probes over internal IP
 // and public IP, we use a global instances provider (globalInstancesProvider).
 type instances struct {
-	pb *configpb.Instances
-	r  *dnsRes.Resolver
+	projects []string
+	pb       *configpb.Instances
+	r        *dnsRes.Resolver
 }
 
 // newInstances returns a new instances object. It will initialize
-// globalInstancesProvider if needed.
-func newInstances(project string, opts *configpb.GlobalOptions, ipb *configpb.Instances, globalResolver *dnsRes.Resolver, l *logger.Logger) (*instances, error) {
+// globalInstancesProvider's if needed.
+func newInstances(projects []string, opts *configpb.GlobalOptions, ipb *configpb.Instances, globalResolver *dnsRes.Resolver, l *logger.Logger) (*instances, error) {
 	reEvalInterval := time.Duration(opts.GetReEvalSec()) * time.Second
 	if ipb.GetNetworkInterface() != nil && ipb.GetUseDnsToResolve() {
 		return nil, errors.New("network_intf and use_dns_to_resolve are mutually exclusive")
@@ -61,13 +59,14 @@ func newInstances(project string, opts *configpb.GlobalOptions, ipb *configpb.In
 	if ipb.GetUseDnsToResolve() && globalResolver == nil {
 		return nil, errors.New("use_dns_to_resolve configured, but globalResolver is nil")
 	}
-	// Initialize global instances provider if not already initialized.
-	if err := initGlobalInstancesProvider(project, opts.GetApiVersion(), reEvalInterval, l); err != nil {
+	// Initialize global instances providers if not already initialized.
+	if err := initGlobalInstancesProvider(projects, opts.GetApiVersion(), reEvalInterval, l); err != nil {
 		return nil, err
 	}
 	return &instances{
-		pb: ipb,
-		r:  globalResolver,
+		projects: projects,
+		pb:       ipb,
+		r:        globalResolver,
 	}, nil
 }
 
@@ -75,20 +74,35 @@ func newInstances(project string, opts *configpb.GlobalOptions, ipb *configpb.In
 // "gcloud compute instances list", but with a cache layer reducing the number
 // of actual API calls made.
 func (i *instances) List() []string {
-	return globalInstancesProvider.list()
+	var instancesList []string
+	for _, project := range i.projects {
+		instancesList = append(instancesList, globalInstancesProvider[project].list()...)
+	}
+	return instancesList
 }
 
 // Resolve resolves the name into an IP address. Unless explicitly configured
 // to use DNS, we use the instance object (retrieved through GCE API) to
-// determine the instance IPs.
+// determine the instance IPs. If multiple instances in different projects share
+// the same name, the instance from the first project mentioned in config will be
+// returned
 func (i *instances) Resolve(name string, ipVer int) (net.IP, error) {
 	if i.pb.GetUseDnsToResolve() {
 		return i.r.Resolve(name, ipVer)
 	}
-	ins := globalInstancesProvider.get(name)
+	var ins *compute.Instance
+	for _, project := range i.projects {
+		provider := globalInstancesProvider[project]
+		if i := provider.get(name); i != nil {
+			ins = i
+			break
+		}
+	}
 	if ins == nil {
 		return nil, fmt.Errorf("gce.instances.resolve(%s): instance not in in-memory GCE instances database", name)
 	}
+
+	// Find the network interface card we are interested in.
 	niIndex := 0
 	ipType := configpb.Instances_NetworkInterface_PRIVATE
 	ni := i.pb.GetNetworkInterface()
@@ -100,14 +114,17 @@ func (i *instances) Resolve(name string, ipVer int) (net.IP, error) {
 		return nil, fmt.Errorf("gce.instances.resolve(%s): no network interface at index: %d", name, niIndex)
 	}
 	intf := ins.NetworkInterfaces[niIndex]
+
 	switch ipType {
 	case configpb.Instances_NetworkInterface_PRIVATE:
 		return net.ParseIP(intf.NetworkIP), nil
+
 	case configpb.Instances_NetworkInterface_PUBLIC:
 		if len(intf.AccessConfigs) == 0 {
 			return nil, fmt.Errorf("gce.instances.resolve(%s): no access config, instance most likely doesn't have a public IP", name)
 		}
 		return net.ParseIP(intf.AccessConfigs[0].NatIP), nil
+
 	case configpb.Instances_NetworkInterface_ALIAS:
 		if len(intf.AliasIpRanges) == 0 {
 			return nil, fmt.Errorf("gce.instances.resolve(%s): no alias IP range", name)
@@ -119,6 +136,7 @@ func (i *instances) Resolve(name string, ipVer int) (net.IP, error) {
 		ip, _, err := net.ParseCIDR(intf.AliasIpRanges[0].IpCidrRange)
 		return ip, err
 	}
+
 	return nil, fmt.Errorf("gce.instances.resolve(%s): unknown IP type for network interface", name)
 }
 
@@ -139,13 +157,9 @@ type instancesProvider struct {
 	cache map[string]*compute.Instance
 }
 
-func initGlobalInstancesProvider(project, apiVersion string, reEvalInterval time.Duration, l *logger.Logger) error {
+func initGlobalInstancesProvider(projects []string, apiVersion string, reEvalInterval time.Duration, l *logger.Logger) error {
 	globalInstancesProviderMu.Lock()
 	defer globalInstancesProviderMu.Unlock()
-
-	if globalInstancesProvider != nil {
-		return nil
-	}
 
 	var thisInstance string
 	if metadata.OnGCE() {
@@ -156,25 +170,32 @@ func initGlobalInstancesProvider(project, apiVersion string, reEvalInterval time
 		}
 		l.Infof("initGlobalInstancesProvider: this instance: %s", thisInstance)
 	}
-	globalInstancesProvider = &instancesProvider{
-		project:      project,
-		apiVersion:   apiVersion,
-		thisInstance: thisInstance,
-		cache:        make(map[string]*compute.Instance),
-		l:            l,
-	}
-	go func() {
-		globalInstancesProvider.expand(0)
-		// Introduce a random delay between 0-reEvalInterval before
-		// starting the refresh loop. If there are multiple cloudprober
-		// instances, this will make sure that each instance calls GCE
-		// API at a different point of time.
-		randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-		time.Sleep(time.Duration(randomDelaySec) * time.Second)
-		for _ = range time.Tick(reEvalInterval) {
-			globalInstancesProvider.expand(reEvalInterval)
+	for _, project := range projects {
+		if globalInstancesProvider[project] != nil {
+			continue
 		}
-	}()
+		provider := &instancesProvider{
+			project:      project,
+			apiVersion:   apiVersion,
+			thisInstance: thisInstance,
+			cache:        make(map[string]*compute.Instance),
+			l:            l,
+		}
+		globalInstancesProvider[project] = provider
+		l.Infof("initGlobalInstancesProvider: for project %s", project)
+		go func() {
+			provider.expand(0)
+			// Introduce a random delay between 0-reEvalInterval before
+			// starting the refresh loop. If there are multiple cloudprober
+			// instances, this will make sure that each instance calls GCE
+			// API at a different point of time.
+			randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
+			time.Sleep(time.Duration(randomDelaySec) * time.Second)
+			for _ = range time.Tick(reEvalInterval) {
+				provider.expand(reEvalInterval)
+			}
+		}()
+	}
 	return nil
 }
 
@@ -194,15 +215,11 @@ func (ip *instancesProvider) list() []string {
 // listInstances runs equivalent API calls as "gcloud compute instances list",
 // and is what is used to populate the cache.
 func listInstances(project, apiVersion string, reEvalInterval time.Duration) ([]*compute.Instance, error) {
-	client, err := google.DefaultClient(oauth2.NoContext, compute.ComputeScope)
+	cs, err := defaultComputeService(apiVersion)
 	if err != nil {
 		return nil, err
 	}
-	cs, err := compute.New(client)
-	if err != nil {
-		return nil, err
-	}
-	cs.BasePath = "https://www.googleapis.com/compute/" + apiVersion + "/projects/"
+
 	zonesList, err := cs.Zones.List(project).Do()
 	if err != nil {
 		return nil, err
@@ -231,13 +248,15 @@ func listInstances(project, apiVersion string, reEvalInterval time.Duration) ([]
 	return result, nil
 }
 
-// expand will refill the cache, and update names.
+// This function will attempt to refresh the cache of GCE targets.
+// This attempt may fail, in which case the function will log and leave the cache untouched,
+// since it is assumed that the cache will be refreshed by a subsequent call.
 func (ip *instancesProvider) expand(reEvalInterval time.Duration) {
-	ip.l.Infof("gce.instances.expand: expanding GCE targets")
+	ip.l.Infof("gce.instances.expand[%s]: expanding GCE targets", ip.project)
 
 	computeInstances, err := listInstances(ip.project, ip.apiVersion, reEvalInterval)
 	if err != nil {
-		ip.l.Errorf("gce.instances.expand: error while getting list of all instances: %v", err)
+		ip.l.Errorf("gce.instances.expand[%s]: error while getting list of all instances: %v", ip.project, err)
 		return
 	}
 

@@ -42,7 +42,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -50,6 +49,9 @@ import (
 	"github.com/google/cloudprober/metrics"
 	"github.com/google/cloudprober/probes/options"
 	configpb "github.com/google/cloudprober/probes/ping/proto"
+	"github.com/google/cloudprober/probes/probeutils"
+	"github.com/google/cloudprober/validators"
+	"github.com/google/cloudprober/validators/integrity"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -58,6 +60,7 @@ import (
 const (
 	protocolICMP     = 1
 	protocolIPv6ICMP = 58
+	dataIntegrityKey = "data-integrity"
 )
 
 // Probe implements a ping probe type that sends ICMP ping packets to the targets and reports
@@ -69,25 +72,18 @@ type Probe struct {
 	l    *logger.Logger
 
 	// book-keeping params
-	source      string
-	ipVer       int
-	targets     []string
-	sent        map[string]int64
-	received    map[string]int64
-	latency     map[string]time.Duration
-	conn        icmpConn
-	runCnt      uint64
-	target2addr map[string]net.Addr
-	ip2target   map[string]string
+	source            string
+	ipVer             int
+	targets           []string
+	sent              map[string]int64
+	received          map[string]int64
+	latency           map[string]metrics.Value
+	validationFailure map[string]*metrics.Map
+	conn              icmpConn
+	runCnt            uint64
+	target2addr       map[string]net.Addr
+	ip2target         map[string]string
 }
-
-// addresser is used for tests, allowing net.InterfaceByName to be mocked.
-type addr interface {
-	Addrs() ([]net.Addr, error)
-}
-
-// interfaceByName is a mocking point for net.InterfaceByName, used for tests.
-var interfaceByName = func(s string) (addr, error) { return net.InterfaceByName(s) }
 
 // Init initliazes the probe with the given params.
 func (p *Probe) Init(name string, opts *options.Options) error {
@@ -108,14 +104,59 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	p.ipVer = int(p.c.GetIpVersion())
 	p.sent = make(map[string]int64)
 	p.received = make(map[string]int64)
-	p.latency = make(map[string]time.Duration)
+	p.latency = make(map[string]metrics.Value)
+	p.validationFailure = make(map[string]*metrics.Map)
 	p.ip2target = make(map[string]string)
 	p.target2addr = make(map[string]net.Addr)
+
+	if err := p.configureIntegrityCheck(); err != nil {
+		return err
+	}
 
 	if err := p.setSourceFromConfig(); err != nil {
 		return err
 	}
 	return p.listen()
+}
+
+func (p *Probe) latencyForTarget(target string) metrics.Value {
+	if val, ok := p.latency[target]; ok {
+		return val
+	}
+
+	var latencyValue metrics.Value
+	if p.opts.LatencyDist != nil {
+		latencyValue = p.opts.LatencyDist.Clone()
+	} else {
+		latencyValue = metrics.NewFloat(0)
+	}
+	p.latency[target] = latencyValue
+
+	return latencyValue
+}
+
+// Adds an integrity validator if data integrity checks are not disabled.
+func (p *Probe) configureIntegrityCheck() error {
+	if p.c.GetDisableIntegrityCheck() {
+		return nil
+	}
+
+	if p.opts.Validators["data-integrity"] != nil {
+		p.l.Warningf("Not adding data-integrity validator as there is already a validator with the name \"data-integrity\": %v", p.opts.Validators["data-integrity"])
+		return nil
+	}
+
+	v, err := integrity.PatternNumBytesValidator(timeBytesSize, p.l)
+	if err != nil {
+		return err
+	}
+
+	if p.opts.Validators == nil {
+		p.opts.Validators = make(map[string]validators.Validator)
+	}
+	p.opts.Validators[dataIntegrityKey] = v
+
+	return nil
 }
 
 // setSourceFromConfig sets the source for ping probes. This is where we listen
@@ -125,21 +166,14 @@ func (p *Probe) setSourceFromConfig() error {
 	case *configpb.ProbeConf_SourceIp:
 		p.source = p.c.GetSourceIp()
 	case *configpb.ProbeConf_SourceInterface:
-		s, err := resolveIntfAddr(p.c.GetSourceInterface())
+		s, err := probeutils.ResolveIntfAddr(p.c.GetSourceInterface())
 		if err != nil {
 			return err
 		}
 		p.l.Infof("Using %v as source address.", p.source)
 		p.source = s
 	default:
-		hostname, err := os.Hostname()
-		if err != nil {
-			return fmt.Errorf("error getting hostname from OS: %v", err)
-		}
-		// TODO(manugarg): This name should resolve for the listen method to work.
-		// We should probably change "listen" to use 0.0.0.0 if p.source doesn't
-		// resolve.
-		p.source = hostname
+		p.source = ""
 	}
 	return nil
 }
@@ -149,15 +183,23 @@ func (p *Probe) listen() error {
 	if p.ipVer == 6 {
 		netProto = "ip6:ipv6-icmp"
 	}
+
 	if p.c.GetUseDatagramSocket() {
 		// udp network represents datagram ICMP sockets. The name is a bit
 		// misleading, but that's what Go's icmp package uses.
 		netProto = fmt.Sprintf("udp%d", p.ipVer)
 	}
-	sourceIP, err := resolveAddr(p.source, p.ipVer)
-	if err != nil || sourceIP == nil {
-		return fmt.Errorf("Bad source address: %s, Err: %v", p.source, err)
+
+	// If source is configured, try to resolve it to make sure it has the same
+	// IP version as p.ipVer.
+	if p.source != "" {
+		sourceIP, err := resolveAddr(p.source, p.ipVer)
+		if err != nil || sourceIP == nil {
+			return fmt.Errorf("Bad source address: %s, Err: %v", p.source, err)
+		}
 	}
+
+	var err error
 	p.conn, err = newICMPConn(netProto, p.source)
 	return err
 }
@@ -319,17 +361,34 @@ func (p *Probe) recvPackets(runID uint16, tracker chan bool) {
 		// we were looking for.
 		outstandingPkts--
 
-		// Check payload integrity unless disabled.
-		if !p.c.GetDisableIntegrityCheck() {
-			if err := verifyPayload(pkt.Data); err != nil {
-				p.l.Errorf("Data corruption error: %v", err)
-				// For data corruption, we skip updating the received and latency metrics.
-				// This means data corruption problems will show as packet loss.
+		if p.opts.Validators != nil {
+			var failedValidations []string
+
+			for name, v := range p.opts.Validators {
+				success, err := v.Validate(nil, pkt.Data)
+				if err != nil {
+					p.l.Errorf("Error while running the validator %s: %v", name, err)
+					continue
+				}
+
+				if !success {
+					if p.validationFailure[target] == nil {
+						p.validationFailure[target] = metrics.NewMap("validator", &metrics.Int{})
+					}
+					p.validationFailure[target].IncKey(name)
+					failedValidations = append(failedValidations, name)
+				}
+			}
+
+			// If any validation failed, return now, leaving the success and latency counters unchanged.
+			if len(failedValidations) > 0 {
+				p.l.Debugf("Target:%s, ping.recvPackets: failed validations: %v.", target, failedValidations)
 				continue
 			}
 		}
+
 		p.received[target]++
-		p.latency[target] += rtt
+		p.latencyForTarget(target).AddFloat64(rtt.Seconds() / p.opts.LatencyUnit.Seconds())
 		p.l.Debugf("Reply from=%s id=%d seq=%d rtt=%s", target, pkt.ID, pkt.Seq, rtt)
 	}
 }
@@ -401,12 +460,12 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			em := metrics.NewEventMetrics(ts).
 				AddMetric("total", metrics.NewInt(p.sent[t])).
 				AddMetric("success", metrics.NewInt(p.received[t])).
-				AddMetric("latency", metrics.NewFloat(p.latency[t].Seconds()/p.opts.LatencyUnit.Seconds())).
+				AddMetric("latency", p.latencyForTarget(t)).
 				AddLabel("ptype", "ping").
 				AddLabel("probe", p.name).
 				AddLabel("dst", t)
 
-			dataChan <- em.Clone()
+			dataChan <- em
 			p.l.Info(em.String())
 		}
 	}

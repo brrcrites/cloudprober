@@ -19,19 +19,73 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/google/cloudprober/logger"
 	configpb "github.com/google/cloudprober/probes/dns/proto"
 	"github.com/google/cloudprober/probes/options"
 	"github.com/google/cloudprober/probes/probeutils"
 	"github.com/google/cloudprober/targets"
+	"github.com/google/cloudprober/validators"
+	validatorpb "github.com/google/cloudprober/validators/proto"
 	"github.com/miekg/dns"
+)
+
+// If question contains a bad domain or type, DNS query response status should
+// contain an error.
+const (
+	questionBadDomain    = "nosuchname"
+	questionBadType      = configpb.QueryType_CAA
+	answerContent        = " 3600 IN A 192.168.0.1"
+	answerMatchPattern   = "3600"
+	answerNoMatchPattern = "NAA"
+)
+
+var (
+	globalLog = logger.Logger{}
 )
 
 type mockClient struct{}
 
-func (*mockClient) Exchange(*dns.Msg, string) (*dns.Msg, time.Duration, error) {
-	return new(dns.Msg), time.Millisecond, nil
+// Exchange implementation that returns an error status if the query is for
+// questionBad[Domain|Type]. This allows us to check if query parameters are
+// populated correctly.
+func (*mockClient) Exchange(in *dns.Msg, _ string) (*dns.Msg, time.Duration, error) {
+	out := &dns.Msg{}
+	question := in.Question[0]
+	if question.Name == questionBadDomain+"." || int(question.Qtype) == int(questionBadType) {
+		out.Rcode = dns.RcodeNameError
+	}
+	answerStr := question.Name + answerContent
+	a, err := dns.NewRR(answerStr)
+	if err != nil {
+		globalLog.Errorf("Error parsing answer \"%s\": %v", answerStr, err)
+	} else {
+		out.Answer = []dns.RR{a}
+	}
+	return out, time.Millisecond, nil
 }
 func (*mockClient) SetReadTimeout(time.Duration) {}
+
+func runProbe(t *testing.T, testName string, p *Probe, total, success int64) {
+	p.client = new(mockClient)
+	p.targets = p.opts.Targets.List()
+
+	resultsChan := make(chan probeutils.ProbeResult, len(p.targets))
+	p.runProbe(resultsChan)
+
+	// The resultsChan output iterates through p.targets in the same order.
+	for _, target := range p.targets {
+		r := <-resultsChan
+		result := r.(probeRunResult)
+		if result.total.Int64() != total || result.success.Int64() != success {
+			t.Errorf("test(%s): result mismatch got (total, success) = (%d, %d), want (%d, %d)",
+				testName, result.total.Int64(), result.success.Int64(), total, success)
+		}
+		if result.Target() != target {
+			t.Errorf("test(%s): unexpected target in probe result. got: %s, want: %s",
+				testName, result.Target(), target)
+		}
+	}
+}
 
 func TestRun(t *testing.T) {
 	p := &Probe{}
@@ -43,29 +97,102 @@ func TestRun(t *testing.T) {
 			StatsExportIntervalMsec: proto.Int32(1000),
 		},
 	}
-	p.Init("dns_test", opts)
-	p.client = new(mockClient)
-	p.targets = p.opts.Targets.List()
-
-	resultsChan := make(chan probeutils.ProbeResult, len(p.targets))
-	p.runProbe(resultsChan)
-
-	// Strings that should be in all targets' output.
-	reqStrs := map[string]int64{
-		"total":   1,
-		"success": 1,
+	if err := p.Init("dns_test", opts); err != nil {
+		t.Fatalf("Error creating probe: %v", err)
 	}
+	runProbe(t, "basic", p, 1, 1)
+}
 
-	// The resultsChan output iterates through p.targets in the same order.
-	for _, target := range p.targets {
-		r := <-resultsChan
-		result := r.(probeRunResult)
-		if result.total.Int64() != reqStrs["total"] || result.success.Int64() != reqStrs["success"] {
-			t.Errorf("Mismatch got (total, success) = (%d, %d), want (%d, %d)", result.total.Int64(), result.success.Int64(), reqStrs["total"], reqStrs["success"])
-		}
-		if result.Target() != target {
-			t.Errorf("Unexpected target in probe result. Got: %s, Expected: %s", result.Target(), target)
-		}
+func TestProbeType(t *testing.T) {
+	p := &Probe{}
+	badType := questionBadType
+	opts := &options.Options{
+		Targets:  targets.StaticTargets("8.8.8.8"),
+		Interval: 2 * time.Second,
+		Timeout:  time.Second,
+		ProbeConf: &configpb.ProbeConf{
+			StatsExportIntervalMsec: proto.Int32(1000),
+			QueryType:               &badType,
+		},
 	}
-	p.runProbe(resultsChan)
+	if err := p.Init("dns_probe_type_test", opts); err != nil {
+		t.Fatalf("Error creating probe: %v", err)
+	}
+	runProbe(t, "probetype", p, 1, 0)
+}
+
+func TestBadName(t *testing.T) {
+	p := &Probe{}
+	opts := &options.Options{
+		Targets:  targets.StaticTargets("8.8.8.8"),
+		Interval: 2 * time.Second,
+		Timeout:  time.Second,
+		ProbeConf: &configpb.ProbeConf{
+			StatsExportIntervalMsec: proto.Int32(1000),
+			ResolvedDomain:          proto.String(questionBadDomain),
+		},
+	}
+	if err := p.Init("dns_bad_domain_test", opts); err != nil {
+		t.Fatalf("Error creating probe: %v", err)
+	}
+	runProbe(t, "baddomain", p, 1, 0)
+}
+
+func TestAnswerCheck(t *testing.T) {
+	p := &Probe{}
+	opts := &options.Options{
+		Targets:  targets.StaticTargets("8.8.8.8"),
+		Interval: 2 * time.Second,
+		Timeout:  time.Second,
+		ProbeConf: &configpb.ProbeConf{
+			StatsExportIntervalMsec: proto.Int32(1000),
+			MinAnswers:              proto.Uint32(1),
+		},
+	}
+	if err := p.Init("dns_probe_answer_check_test", opts); err != nil {
+		t.Fatalf("Error creating probe: %v", err)
+	}
+	// expect success minAnswers == num answers returned == 1.
+	runProbe(t, "matchminanswers", p, 1, 1)
+
+	opts.ProbeConf = &configpb.ProbeConf{
+		StatsExportIntervalMsec: proto.Int32(1000),
+		MinAnswers:              proto.Uint32(2),
+	}
+	if err := p.Init("dns_probe_answer_check_test", opts); err != nil {
+		t.Fatalf("Error creating probe: %v", err)
+	}
+	// expect failure because only one answer returned and two wanted.
+	runProbe(t, "toofewanswers", p, 1, 0)
+}
+
+func TestValidator(t *testing.T) {
+	p := &Probe{}
+	for _, tst := range []struct {
+		name      string
+		pattern   string
+		successCt int64
+	}{
+		{"match", answerMatchPattern, 1},
+		{"nomatch", answerNoMatchPattern, 0},
+	} {
+		valPb := []*validatorpb.Validator{{Name: proto.String(tst.name), Type: &validatorpb.Validator_Regex{tst.pattern}}}
+		validator, err := validators.Init(valPb, nil)
+		if err != nil {
+			t.Fatalf("Error initializing validator for pattern %v: %v", tst.pattern, err)
+		}
+		opts := &options.Options{
+			Targets:  targets.StaticTargets("8.8.8.8"),
+			Interval: 2 * time.Second,
+			Timeout:  time.Second,
+			ProbeConf: &configpb.ProbeConf{
+				StatsExportIntervalMsec: proto.Int32(1000),
+			},
+			Validators: validator,
+		}
+		if err := p.Init("dns_probe_answer_"+tst.name, opts); err != nil {
+			t.Fatalf("Error creating probe: %v", err)
+		}
+		runProbe(t, tst.name, p, 1, tst.successCt)
+	}
 }

@@ -6,7 +6,9 @@ package cloudprober.targets.gce;
 // TargetsConf represents GCE targets, e.g. instances, forwarding rules etc.
 message TargetsConf {
   // If running on GCE, this defaults to the local project.
-  optional string project = 1;
+  // Note: Multiple projects support in targets is experimental and may go away
+  // with future iterations.
+  repeated string project = 1;
 
   oneof type {
     Instances instances = 2;
@@ -42,8 +44,17 @@ message Instances {
   optional NetworkInterface network_interface = 2;
 }
 
-// Represents GCE forwarding rules
+// Represents GCE forwarding rules. Does not support multiple projects
 message ForwardingRules {
+  // Important: if multiple probes use forwarding_rules targets, only the
+  // settings in the definition will take effect.
+  // TODO(manugarg): Fix this behavior.
+  //
+  // For regional forwarding rules, regions to return forwarding rules for.
+  // Default is to return forwarding rules from the region that the VM is
+  // running in. To return forwarding rules from all regions, specify region as
+  // "all".
+  repeated string region = 1;
 }
 
 // Global GCE targets options. These options are independent of the per-probe

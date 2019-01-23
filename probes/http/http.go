@@ -59,20 +59,22 @@ type Probe struct {
 // types instead of metrics.AtomicInt.
 // probeRunResult implements the probeutils.ProbeResult interface.
 type probeRunResult struct {
-	target     string
-	total      metrics.Int
-	success    metrics.Int
-	latency    metrics.Value
-	timeouts   metrics.Int
-	respCodes  *metrics.Map
-	respBodies *metrics.Map
+	target            string
+	total             metrics.Int
+	success           metrics.Int
+	latency           metrics.Value
+	timeouts          metrics.Int
+	respCodes         *metrics.Map
+	respBodies        *metrics.Map
+	validationFailure *metrics.Map
 }
 
 func newProbeRunResult(target string, opts *options.Options) probeRunResult {
 	prr := probeRunResult{
-		target:     target,
-		respCodes:  metrics.NewMap("code", &metrics.Int{}),
-		respBodies: metrics.NewMap("resp", &metrics.Int{}),
+		target:            target,
+		respCodes:         metrics.NewMap("code", &metrics.Int{}),
+		respBodies:        metrics.NewMap("resp", &metrics.Int{}),
+		validationFailure: metrics.NewMap("validator", &metrics.Int{}),
 	}
 	if opts.LatencyDist != nil {
 		prr.latency = opts.LatencyDist.Clone()
@@ -92,7 +94,8 @@ func (prr probeRunResult) Metrics() *metrics.EventMetrics {
 		AddMetric("latency", prr.latency).
 		AddMetric("timeouts", &prr.timeouts).
 		AddMetric("resp-code", prr.respCodes).
-		AddMetric("resp-body", prr.respBodies)
+		AddMetric("resp-body", prr.respBodies).
+		AddMetric("validation_failure", prr.validationFailure)
 }
 
 // Target returns the p.target. This method is part of the probeutils.ProbeResult
@@ -122,12 +125,28 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 		return fmt.Errorf("Invalid Relative URL: %s, must begin with '/'", p.url)
 	}
 
+	if p.c.GetIntegrityCheckPattern() != "" {
+		p.l.Warningf("integrity_check_pattern field is now deprecated and doesn't do anything.")
+	}
+
 	// Needs to be non-nil so we can set parameters on it.
 	transport := http.DefaultTransport
 
 	// Keep idle connections open until we explicitly close them.
 	// This allows us to send multiple requests over the same connection.
 	transport.(*http.Transport).MaxIdleConnsPerHost = 1
+
+	// Extract source IP from config if present and set in transport.
+	if p.c.GetSource() != nil {
+		source, err := p.getSourceFromConfig()
+		if err != nil {
+			return err
+		}
+
+		if err := p.setSourceInTransport(transport.(*http.Transport), source); err != nil {
+			return err
+		}
+	}
 
 	// Clients are safe for concurrent use by multiple goroutines.
 	p.client = &http.Client{
@@ -136,6 +155,46 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	}
 
 	return nil
+}
+
+// setSourceInTransport sets the provided source IP of the probe in the HTTP Transport.
+func (p *Probe) setSourceInTransport(transport *http.Transport, source string) error {
+	sourceIP := net.ParseIP(source)
+	if sourceIP == nil {
+		return fmt.Errorf("invalid source IP: %s", source)
+	}
+	sourceAddr := net.TCPAddr{
+		IP: sourceIP,
+	}
+
+	dialer := &net.Dialer{
+		LocalAddr: &sourceAddr,
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
+	transport.DialContext = dialer.DialContext
+
+	return nil
+}
+
+// getSourceFromConfig returns the source IP from the config either directly
+// or by resolving the network interface to an IP, depending on which is provided.
+func (p *Probe) getSourceFromConfig() (string, error) {
+	switch p.c.Source.(type) {
+	case *configpb.ProbeConf_SourceIp:
+		return p.c.GetSourceIp(), nil
+	case *configpb.ProbeConf_SourceInterface:
+		intf := p.c.GetSourceInterface()
+		s, err := probeutils.ResolveIntfAddr(intf)
+		if err != nil {
+			return "", err
+		}
+		p.l.Infof("Using %v as source address for interface %s.", s, intf)
+		return s, nil
+	default:
+		return "", fmt.Errorf("unknown source type: %v", p.c.GetSource())
+	}
 }
 
 // Return true if the underlying error indicates a http.Client timeout.
@@ -176,11 +235,24 @@ func (p *Probe) httpRequest(req *http.Request, result *probeRunResult) {
 	// Calling Body.Close() allows the TCP connection to be reused.
 	resp.Body.Close()
 	result.respCodes.IncKey(fmt.Sprintf("%d", resp.StatusCode))
-	if p.c.GetIntegrityCheckPattern() != "" && resp.StatusCode == http.StatusOK {
-		err := probeutils.VerifyPayloadPattern(respBody, []byte(p.c.GetIntegrityCheckPattern()))
-		if err != nil {
-			// TODO(manugarg): Increment a counter on data corruption.
-			p.l.Errorf("Target:%s, URL:%s, http.runProbe: possible data corruption, response integrity check failed: %s", req.Host, req.URL.String(), err.Error())
+
+	if p.opts.Validators != nil {
+		validationFailed := false
+
+		for name, v := range p.opts.Validators {
+			success, err := v.Validate(resp, respBody)
+			if err != nil {
+				p.l.Errorf("Error while running the validator %s: %v", name, err)
+				continue
+			}
+			if !success {
+				result.validationFailure.IncKey(name)
+				p.l.Debugf("Target:%s, URL:%s, http.runProbe: validation %s failed.", req.Host, req.URL.String(), name)
+				validationFailed = true
+			}
+		}
+		// If any validation failed, return now, leaving the success and latency counters unchanged.
+		if validationFailed {
 			return
 		}
 	}
@@ -194,9 +266,11 @@ func (p *Probe) httpRequest(req *http.Request, result *probeRunResult) {
 	}
 }
 
-func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
+func (p *Probe) runProbe(ctx context.Context, resultsChan chan<- probeutils.ProbeResult) {
 	// Refresh the list of targets to probe.
 	p.targets = p.opts.Targets.List()
+	reqCtx, cancelReqCtx := context.WithTimeout(ctx, p.opts.Timeout)
+	defer cancelReqCtx()
 
 	wg := sync.WaitGroup{}
 	for _, target := range p.targets {
@@ -235,7 +309,7 @@ func (p *Probe) runProbe(resultsChan chan<- probeutils.ProbeResult) {
 			}
 
 			for i := 0; i < int(p.c.GetRequestsPerProbe()); i++ {
-				p.httpRequest(req, &result)
+				p.httpRequest(req.WithContext(reqCtx), &result)
 				time.Sleep(time.Duration(p.c.GetRequestsIntervalMsec()) * time.Millisecond)
 			}
 			resultsChan <- result
@@ -271,6 +345,6 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			return
 		default:
 		}
-		p.runProbe(resultsChan)
+		p.runProbe(ctx, resultsChan)
 	}
 }

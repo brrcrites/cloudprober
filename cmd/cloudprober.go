@@ -34,6 +34,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/google/cloudprober"
 	"github.com/google/cloudprober/config"
+	"github.com/google/cloudprober/config/runconfig"
 	"github.com/google/cloudprober/sysvars"
 	"github.com/google/cloudprober/web"
 )
@@ -44,6 +45,7 @@ var (
 	cpuprofile       = flag.String("cpuprof", "", "Write cpu profile to file")
 	memprofile       = flag.String("memprof", "", "Write heap profile to file")
 	configTest       = flag.Bool("configtest", false, "Dry run to test config file")
+	dumpConfig       = flag.Bool("dumpconfig", false, "Dump processed config to stdout")
 	testInstanceName = flag.String("test_instance_name", "ig-us-central1-a-01-0000", "Instance name example to be used in tests")
 
 	// configTestVars provides a sane set of sysvars for config testing.
@@ -141,12 +143,24 @@ func getConfig() string {
 func main() {
 	flag.Parse()
 
+	runconfig.SetVersion(version)
+
 	if *versionFlag {
 		fmt.Println(version)
 		return
 	}
 
 	setupConfigTestVars()
+
+	if *dumpConfig {
+		sysvars.Init(nil, configTestVars)
+		text, err := config.ParseTemplate(getConfig(), sysvars.Vars())
+		if err != nil {
+			glog.Exitf("Error parsing config file. Err: %v", err)
+		}
+		fmt.Println(text)
+		return
+	}
 
 	if *configTest {
 		sysvars.Init(nil, configTestVars)

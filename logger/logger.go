@@ -77,7 +77,6 @@ func New(ctx context.Context, logName string) (*Logger, error) {
 	if !metadata.OnGCE() {
 		return l, nil
 	}
-
 	projectID, err := metadata.ProjectID()
 	if err != nil {
 		return nil, err
@@ -154,14 +153,24 @@ func (l *Logger) log(severity logging.Severity, payload interface{}) {
 		textPayload = textPayload[:MaxLogEntrySize-truncateMsgLen] + truncateMsg
 		payload = textPayload
 	}
-	if l.logc == nil {
-		genericLog(2, severity, textPayload)
+	if l == nil || l.logc == nil {
+		genericLog(severity, textPayload)
 		return
 	}
 	l.logger.Log(logging.Entry{
 		Severity: severity,
 		Payload:  payload,
 	})
+}
+
+// close closes the cloud logging client if it exists. This flushes the buffer
+// and should be called before exiting the program to ensure all logs are persisted.
+func (l *Logger) close() error {
+	if l != nil && l.logc != nil {
+		return l.logc.Close()
+	}
+
+	return nil
 }
 
 // Debug logs messages with logging level set to "Debug".
@@ -187,9 +196,12 @@ func (l *Logger) Error(payload interface{}) {
 }
 
 // Critical logs messages with logging level set to "Critical" and
-// exits the process with error status.
+// exits the process with error status. The buffer is flushed before exiting.
 func (l *Logger) Critical(payload interface{}) {
 	l.log(logging.Critical, payload)
+	if err := l.close(); err != nil {
+		panic(fmt.Sprintf("could not close client: %v", err))
+	}
 	os.Exit(1)
 }
 
@@ -215,12 +227,21 @@ func (l *Logger) Errorf(format string, args ...interface{}) {
 	l.log(logging.Error, fmt.Sprintf(format, args...))
 }
 
-// Criticalf logs formatted text messages with logging level "Critical".
+// Criticalf logs formatted text messages with logging level "Critical" and
+// exits the process with error status. The buffer is flushed before exiting.
 func (l *Logger) Criticalf(format string, args ...interface{}) {
 	l.log(logging.Critical, fmt.Sprintf(format, args...))
+	if err := l.close(); err != nil {
+		panic(fmt.Sprintf("could not close client: %v", err))
+	}
+	os.Exit(1)
 }
 
-func genericLog(depth int, severity logging.Severity, s string) {
+func genericLog(severity logging.Severity, s string) {
+	// Set the caller frame depth to 3 so that can get to the actual caller of
+	// the logger. genericLog -> log -> Info* -> actualCaller
+	depth := 3
+
 	switch severity {
 	case logging.Debug, logging.Info:
 		glog.InfoDepth(depth, s)

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/google/cloudprober/config/runconfig"
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/metrics"
 )
@@ -75,6 +76,11 @@ func parseEnvVars(envVarsName string) map[string]string {
 	return envVars
 }
 
+// StartTime returns cloudprober's start time.
+func StartTime() time.Time {
+	return startTime
+}
+
 // Init initializes the sysvars module's global data structure. Init makes sure
 // to initialize only once, further calls are a no-op. If needed, userVars
 // can be passed to Init to add custom variables to sysVars. This can be useful
@@ -89,7 +95,9 @@ func Init(ll *logger.Logger, userVars map[string]string) error {
 
 	l = ll
 	startTime = time.Now()
-	sysVars = make(map[string]string)
+	sysVars = map[string]string{
+		"version": runconfig.Version(),
+	}
 
 	hostname, err := os.Hostname()
 	if err != nil {

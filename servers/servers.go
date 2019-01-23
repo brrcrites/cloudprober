@@ -19,17 +19,44 @@ package servers
 
 import (
 	"context"
+	"html/template"
 
 	"github.com/google/cloudprober/logger"
 	"github.com/google/cloudprober/metrics"
+	"github.com/google/cloudprober/servers/grpc"
 	"github.com/google/cloudprober/servers/http"
 	configpb "github.com/google/cloudprober/servers/proto"
 	"github.com/google/cloudprober/servers/udp"
+	"github.com/google/cloudprober/web/formatutils"
 )
 
 const (
 	logsNamePrefix = "cloudprober"
 )
+
+// StatusTmpl variable stores the HTML template suitable to generate the
+// servers' status for cloudprober's /status page. It expects an array of
+// ServerInfo objects as input.
+var StatusTmpl = template.Must(template.New("statusTmpl").Parse(`
+<table class="status-list">
+  <tr>
+    <th>Type</th>
+    <th>Conf</th>
+  </tr>
+  {{ range . }}
+  <tr>
+    <td>{{.Type}}</td>
+    <td>
+    {{if .Conf}}
+      <pre>{{.Conf}}</pre>
+    {{else}}
+      default
+    {{end}}
+    </td>
+  </tr>
+  {{ end }}
+</table>
+`))
 
 func newLogger(ctx context.Context, logName string) (*logger.Logger, error) {
 	return logger.New(ctx, logsNamePrefix+"."+logName)
@@ -40,25 +67,45 @@ type Server interface {
 	Start(ctx context.Context, dataChan chan<- *metrics.EventMetrics) error
 }
 
+// ServerInfo encapsulates a Server and related info.
+type ServerInfo struct {
+	Server
+	Type string
+	Conf string
+}
+
 // Init initializes cloudprober servers, based on the provided config.
-func Init(initCtx context.Context, serverDefs []*configpb.ServerDef) (servers []Server, err error) {
+func Init(initCtx context.Context, serverDefs []*configpb.ServerDef) (servers []*ServerInfo, err error) {
 	for _, serverDef := range serverDefs {
 		var l *logger.Logger
 		l, err = newLogger(initCtx, serverDef.GetType().String())
 		if err != nil {
 			return
 		}
+
+		var conf interface{}
 		var server Server
+
 		switch serverDef.GetType() {
 		case configpb.ServerDef_HTTP:
 			server, err = http.New(initCtx, serverDef.GetHttpServer(), l)
+			conf = serverDef.GetHttpServer()
 		case configpb.ServerDef_UDP:
 			server, err = udp.New(initCtx, serverDef.GetUdpServer(), l)
+			conf = serverDef.GetUdpServer()
+		case configpb.ServerDef_GRPC:
+			server, err = grpc.New(initCtx, serverDef.GetGrpcServer(), l)
+			conf = serverDef.GetGrpcServer()
 		}
 		if err != nil {
 			return
 		}
-		servers = append(servers, server)
+
+		servers = append(servers, &ServerInfo{
+			Server: server,
+			Type:   serverDef.GetType().String(),
+			Conf:   formatutils.ConfToString(conf),
+		})
 	}
 	return
 }

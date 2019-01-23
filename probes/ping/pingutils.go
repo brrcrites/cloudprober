@@ -22,27 +22,26 @@ import (
 	"github.com/google/cloudprober/probes/probeutils"
 )
 
+const timeBytesSize = 8
+
 func timeToBytes(t time.Time, size int) []byte {
 	nsec := t.UnixNano()
-	var timeBytes [8]byte
-	for i := uint8(0); i < 8; i++ {
-		timeBytes[i] = byte((nsec >> ((7 - i) * 8)) & 0xff)
+	var timeBytes [timeBytesSize]byte
+	for i := uint8(0); i < timeBytesSize; i++ {
+		// To get timeBytes:
+		// 0th byte - shift bits by 56 (7*8) bits, AND with 0xff to get the last 8 bits
+		// 1st byte - shift bits by 48 (6*8) bits, AND with 0xff to get the last 8 bits
+		// ... ...
+		// 7th byte - shift bits by 0 (0*8) bits, AND with 0xff to get the last 8 bits
+		timeBytes[i] = byte((nsec >> ((timeBytesSize - i - 1) * timeBytesSize)) & 0xff)
 	}
 	return probeutils.PatternPayload(timeBytes[:], size)
 }
 
-// verifyPayload verifies that in the provided byte array first 8-bytes are
-// repeated for the rest array, except for the last "len(array) mod 8 bytes".
-func verifyPayload(b []byte) error {
-	// Since we set the pattern ourselves in timeToBytes, we know that the pattern
-	// is 8-bytes long (timestamp).
-	return probeutils.VerifyPayloadPattern(b, b[:8])
-}
-
 func bytesToTime(b []byte) time.Time {
 	var nsec int64
-	for i := uint8(0); i < 8; i++ {
-		nsec += int64(b[i]) << ((7 - i) * 8)
+	for i := uint8(0); i < timeBytesSize; i++ {
+		nsec += int64(b[i]) << ((timeBytesSize - i - 1) * timeBytesSize)
 	}
 	return time.Unix(0, nsec)
 }
@@ -76,31 +75,4 @@ func resolveAddr(t string, ver int) (net.IP, error) {
 		}
 	}
 	return nil, fmt.Errorf("no good IPs found for the ip version (%d). IPs found: %q", ver, ips)
-}
-
-// resolveIntfAddr takes the name of a network interface, and returns the first ip
-// address listed for this interface. This is typically the IPv4 address.
-func resolveIntfAddr(intfName string) (string, error) {
-	i, err := interfaceByName(intfName)
-	if err != nil {
-		return "", fmt.Errorf("ping.resolveIntfAddr(%v) got error getting interface: %v", intfName, err)
-	}
-	addrs, err := i.Addrs()
-	if err != nil {
-		return "", fmt.Errorf("ping.resolveIntfAddr(%v) got error getting addresses for interface: %v", intfName, err)
-	} else if len(addrs) == 0 {
-		return "", fmt.Errorf("ping.resolveIntfAddr(%v) go 0 addrs for interface", intfName)
-	}
-	// i.Addrs() mostly returns network addresses of the form "172.17.90.252/23".
-	// This bit of code will pull the IP address from this address.
-	var ip net.IP
-	switch v := addrs[0].(type) {
-	case *net.IPNet:
-		ip = v.IP
-	case *net.IPAddr:
-		ip = v.IP
-	default:
-		return "", fmt.Errorf("ping.resolveIntfAddr(%v) found unknown type for first address: %T", intfName, v)
-	}
-	return ip.String(), nil
 }

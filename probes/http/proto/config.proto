@@ -29,6 +29,13 @@ message ProbeConf {
   optional string relative_url = 2;
   // Port, default is 80 for HTTP and 443 for HTTPS
   optional int32 port = 3;
+  // Set the source address to send packets from, either by providing an address
+  // or a network interface. Note: the source can also be configured dynamically
+  // using an environment variable.
+  oneof source {
+    string source_ip = 10;
+    string source_interface = 11;
+  }
   // Whether to resolve the target before making the request. If set to false,
   // we hand over the target and relative_url directly to the golang's HTTP
   // module, Otherwise, we resolve the target first to an IP address and
@@ -36,9 +43,9 @@ message ProbeConf {
   optional bool resolve_first = 4 [default = false];
   // Export response (body) count as a metric
   optional bool export_response_as_metrics = 5 [default = false];
-  // If specified, this string is used for payload's integrity check.
-  // Note: This feature is experimental and will most likely be replaced by a
-  // generic validator framework.
+  // This field is now deprecated and doesn't do anything (except resulting in
+  // a warning). It will be removed in the next release. For data integrity
+  // checks, please use integrity validator.
   optional string integrity_check_pattern = 6;
   // HTTP request method
   optional Method method = 7 [default = GET];

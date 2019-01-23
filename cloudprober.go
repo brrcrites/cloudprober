@@ -63,12 +63,12 @@ var proberMu sync.Mutex
 
 // Prober represents a collection of probes where each probe implements the Probe interface.
 type Prober struct {
-	Probes         map[string]probes.Probe
-	Servers        []servers.Server
+	Probes         map[string]*probes.ProbeInfo
+	Servers        []*servers.ServerInfo
 	c              *configpb.ProberConfig
 	rdsServer      *rdsserver.Server
 	rtcReporter    *rtcreporter.Reporter
-	surfacers      []surfacers.Surfacer
+	surfacers      []*surfacers.SurfacerInfo
 	serverListener net.Listener
 
 	// Used by GetConfig for /config handler.
@@ -106,6 +106,7 @@ func (pr *Prober) initDefaultServer() error {
 
 // InitFromConfig initializes Cloudprober using the provided config.
 func InitFromConfig(configFile string) error {
+	// Return immediately if prober is already initialized.
 	proberMu.Lock()
 	defer proberMu.Unlock()
 	if prober != nil {
@@ -230,7 +231,7 @@ func (pr *Prober) start(ctx context.Context) {
 			em = <-dataChan
 			var s = em.String()
 			if len(s) > logger.MaxLogEntrySize {
-				glog.Warningf("Metric entry for timestamp %d dropped due to large size: %d", em.Timestamp, len(s))
+				glog.Warningf("Metric entry for timestamp %v dropped due to large size: %d", em.Timestamp, len(s))
 				continue
 			}
 
@@ -283,4 +284,11 @@ func GetConfig() string {
 	proberMu.Lock()
 	defer proberMu.Unlock()
 	return prober.textConfig
+}
+
+// GetInfo returns information on all the probes, servers and surfacers.
+func GetInfo() (map[string]*probes.ProbeInfo, []*surfacers.SurfacerInfo, []*servers.ServerInfo) {
+	proberMu.Lock()
+	defer proberMu.Unlock()
+	return prober.Probes, prober.surfacers, prober.Servers
 }

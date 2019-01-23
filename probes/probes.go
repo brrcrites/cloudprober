@@ -39,6 +39,8 @@ import (
 	"github.com/google/cloudprober/targets"
 	"github.com/google/cloudprober/targets/lameduck"
 	targetspb "github.com/google/cloudprober/targets/proto"
+	"github.com/google/cloudprober/validators"
+	"github.com/google/cloudprober/web/formatutils"
 )
 
 const (
@@ -77,6 +79,19 @@ type Probe interface {
 	Start(ctx context.Context, dataChan chan *metrics.EventMetrics)
 }
 
+// ProbeInfo encapsulates the probe and associated information.
+type ProbeInfo struct {
+	Probe
+	Name          string
+	Type          string
+	Interval      string
+	Timeout       string
+	TargetsDesc   string
+	LatencyDistLB string
+	LatencyUnit   string
+	ProbeConf     string
+}
+
 func newLogger(probeName string) (*logger.Logger, error) {
 	return logger.New(context.Background(), logsNamePrefix+"."+probeName)
 }
@@ -109,14 +124,52 @@ func getExtensionProbe(p *configpb.ProbeDef) (Probe, interface{}, error) {
 	return newProbeFunc(), value, nil
 }
 
+// buildProbeOptions builds probe's options using the provided config and some global params.
+func buildProbeOptions(p *configpb.ProbeDef, ldLister lameduck.Lister, globalTargetsOpts *targetspb.GlobalTargetsOptions, l *logger.Logger) (*options.Options, error) {
+	opts := &options.Options{
+		Interval: time.Duration(p.GetIntervalMsec()) * time.Millisecond,
+		Timeout:  time.Duration(p.GetTimeoutMsec()) * time.Millisecond,
+	}
+
+	var err error
+	if opts.Logger, err = newLogger(p.GetName()); err != nil {
+		return nil, fmt.Errorf("error in initializing logger for the probe (%s): %v", p.GetName(), err)
+	}
+
+	if opts.Targets, err = targets.New(p.GetTargets(), ldLister, globalTargetsOpts, l, opts.Logger); err != nil {
+		return nil, err
+	}
+
+	if latencyDist := p.GetLatencyDistribution(); latencyDist != nil {
+		var d *metrics.Distribution
+		if d, err = metrics.NewDistributionFromProto(latencyDist); err != nil {
+			return nil, fmt.Errorf("error creating distribution from the specification (%v): %v", latencyDist, err)
+		}
+		opts.LatencyDist = d
+	}
+
+	// latency_unit is specified as a human-readable string, e.g. ns, ms, us etc.
+	if opts.LatencyUnit, err = time.ParseDuration("1" + p.GetLatencyUnit()); err != nil {
+		return nil, fmt.Errorf("failed to parse the latency unit (%s): %v", p.GetLatencyUnit(), err)
+	}
+
+	if len(p.GetValidator()) > 0 {
+		opts.Validators, err = validators.Init(p.GetValidator(), opts.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize validators: %v", err)
+		}
+	}
+	return opts, nil
+}
+
 // Init initializes the probes defined in the config.
-func Init(probeProtobufs []*configpb.ProbeDef, globalTargetsOpts *targetspb.GlobalTargetsOptions, l *logger.Logger, sysVars map[string]string) (map[string]Probe, error) {
+func Init(probeProtobufs []*configpb.ProbeDef, globalTargetsOpts *targetspb.GlobalTargetsOptions, l *logger.Logger, sysVars map[string]string) (map[string]*ProbeInfo, error) {
 	ldLister, err := lameduck.GetDefaultLister()
 	if err != nil {
 		l.Warningf("Error while getting default lameduck lister, lameduck behavior will be disabled. Err: %v", err)
 	}
 
-	probes := make(map[string]Probe)
+	probes := make(map[string]*ProbeInfo)
 
 	for _, p := range probeProtobufs {
 		// Check if this probe is supposed to run here.
@@ -132,60 +185,60 @@ func Init(probeProtobufs []*configpb.ProbeDef, globalTargetsOpts *targetspb.Glob
 			return nil, fmt.Errorf("bad config: probe %s is already defined", p.GetName())
 		}
 
-		// Build probe options.
-		opts := &options.Options{
-			Interval: time.Duration(p.GetIntervalMsec()) * time.Millisecond,
-			Timeout:  time.Duration(p.GetTimeoutMsec()) * time.Millisecond,
-		}
-		if opts.Logger, err = newLogger(p.GetName()); err != nil {
-			return nil, fmt.Errorf("error in initializing logger for the probe (%s): %v", p.GetName(), err)
-		}
-		if opts.Targets, err = targets.New(p.GetTargets(), ldLister, globalTargetsOpts, l, opts.Logger); err != nil {
-			return nil, err
-		}
-		if latencyDist := p.GetLatencyDistribution(); latencyDist != nil {
-			var d *metrics.Distribution
-			if d, err = metrics.NewDistributionFromProto(latencyDist); err != nil {
-				return nil, fmt.Errorf("error creating distribution from the specification (%v): %v", latencyDist, err)
-			}
-			opts.LatencyDist = d
-		}
-		// latency_unit is specified as a human-readable string, e.g. ns, ms, us etc.
-		if opts.LatencyUnit, err = time.ParseDuration("1" + p.GetLatencyUnit()); err != nil {
-			return nil, fmt.Errorf("failed to parse the latency unit (%s): %v", p.GetLatencyUnit(), err)
-		}
-		l.Infof("Creating a %s probe: %s", p.GetType(), p.GetName())
-		probe, err := initProbe(p, opts)
+		opts, err := buildProbeOptions(p, ldLister, globalTargetsOpts, l)
 		if err != nil {
 			return nil, err
 		}
-		probes[p.GetName()] = probe
+
+		l.Infof("Creating a %s probe: %s", p.GetType(), p.GetName())
+		probe, probeConf, err := initProbe(p, opts)
+		if err != nil {
+			return nil, err
+		}
+
+		latencyDistLB := ""
+		if opts.LatencyDist != nil {
+			latencyDistLB = fmt.Sprintf("%v", opts.LatencyDist.Data().LowerBounds)
+		}
+
+		probes[p.GetName()] = &ProbeInfo{
+			Probe:         probe,
+			Name:          p.GetName(),
+			Type:          p.GetType().String(),
+			Interval:      opts.Interval.String(),
+			Timeout:       opts.Timeout.String(),
+			TargetsDesc:   p.Targets.String(),
+			LatencyDistLB: latencyDistLB,
+			LatencyUnit:   opts.LatencyUnit.String(),
+			ProbeConf:     formatutils.ConfToString(probeConf),
+		}
 	}
+
 	return probes, nil
 }
 
-func initProbe(p *configpb.ProbeDef, opts *options.Options) (probe Probe, err error) {
+func initProbe(p *configpb.ProbeDef, opts *options.Options) (probe Probe, probeConf interface{}, err error) {
 	switch p.GetType() {
 	case configpb.ProbeDef_PING:
 		probe = &ping.Probe{}
-		opts.ProbeConf = p.GetPingProbe()
+		probeConf = p.GetPingProbe()
 	case configpb.ProbeDef_HTTP:
 		probe = &httpprobe.Probe{}
-		opts.ProbeConf = p.GetHttpProbe()
+		probeConf = p.GetHttpProbe()
 	case configpb.ProbeDef_DNS:
 		probe = &dns.Probe{}
-		opts.ProbeConf = p.GetDnsProbe()
+		probeConf = p.GetDnsProbe()
 	case configpb.ProbeDef_EXTERNAL:
 		probe = &external.Probe{}
-		opts.ProbeConf = p.GetExternalProbe()
+		probeConf = p.GetExternalProbe()
 	case configpb.ProbeDef_UDP:
 		probe = &udp.Probe{}
-		opts.ProbeConf = p.GetUdpProbe()
+		probeConf = p.GetUdpProbe()
 	case configpb.ProbeDef_UDP_LISTENER:
 		probe = &udplistener.Probe{}
-		opts.ProbeConf = p.GetUdpListenerProbe()
+		probeConf = p.GetUdpListenerProbe()
 	case configpb.ProbeDef_EXTENSION:
-		probe, opts.ProbeConf, err = getExtensionProbe(p)
+		probe, probeConf, err = getExtensionProbe(p)
 		if err != nil {
 			return
 		}
@@ -197,11 +250,13 @@ func initProbe(p *configpb.ProbeDef, opts *options.Options) (probe Probe, err er
 			err = fmt.Errorf("unregistered user defined probe: %s", p.GetName())
 			return
 		}
-		opts.ProbeConf = p.GetUserDefinedProbe()
+		probeConf = p.GetUserDefinedProbe()
 	default:
 		err = fmt.Errorf("unknown probe type: %s", p.GetType())
 		return
 	}
+
+	opts.ProbeConf = probeConf
 	err = probe.Init(p.GetName(), opts)
 	return
 }
